@@ -1,0 +1,390 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <stdio.h>
+#include <iomanip>
+
+#include <pcap.h>
+#include "time.h"
+//#include <winsock2.h>
+
+#include <list>
+#include <map>
+#include <vector>
+
+//#include <CImg.h>
+using namespace std;
+//using namespace cimg_library;
+
+struct tm timetracker;  // Stores the current time value every ~30 minutes
+struct tm currentTime;  // Stores the time of the current packet
+struct tm lastTime;     // Stores the time of the last packet
+u_int packetCount = 0;
+vector<char*> protocolList{ "tcp and ip", "udp" , "icmp"};
+int protocolIterator = 0;   // Iterates through protocolList
+int currentProtocol = 0;
+int traceCounter = 0;
+
+void printFlowMap();
+
+/* 4 bytes IP address */
+class ip_address{
+    public:
+    u_char byte1;
+    u_char byte2;
+    u_char byte3;
+    u_char byte4;
+
+};
+bool operator==(const ip_address p1, const ip_address p2){
+    return ((p1.byte1 == p2.byte1)
+         && (p1.byte2 == p2.byte2)
+         && (p1.byte3 == p2.byte3)
+         && (p1.byte4 == p2.byte4));
+}
+bool operator<(const ip_address p1, const ip_address p2){
+    if (p1.byte1 < p2.byte1)
+        return true;
+    else if (p1.byte1 > p2.byte2)
+        return false;
+    if (p1.byte2 < p2.byte2)
+        return true;
+    else if (p1.byte2 > p2.byte2)
+        return false;
+    if (p1.byte3 < p2.byte3)
+        return true;
+    else if (p1.byte3 > p2.byte3)
+        return false;
+    if (p1.byte4 < p2.byte4)
+        return true;
+    return false;
+}
+
+class ip_header{
+    public:
+    u_char  ver_ihl;        // Version (4 bits) + Internet header length (4 bits)
+    u_char  tos;            // Type of service
+    u_short tlen;           // Total length
+    u_short identification; // Identification
+    u_short flags_fo;       // Flags (3 bits) + Fragment offset (13 bits)
+    u_char  ttl;            // Time to live
+    u_char  proto;          // Protocol
+    u_short crc;            // Header checksum
+    ip_address  saddr;      // Source address
+    ip_address  daddr;      // Destination address
+    u_int   op_pad;         // Option + Padding
+};
+class udp_header{
+    public:
+    u_short sport;          // Source port
+    u_short dport;          // Destination port
+    u_short len;            // Datagram length
+    u_short crc;            // Checksum
+};
+
+
+class flowIdentifier{
+public:
+    ip_address srcip;
+    ip_address dstip;
+    u_short srcport;
+    u_short dstport;
+    u_char proto; // 0 = tcp/ip, 1 = udp, 2 = icmp
+};
+bool operator==(const flowIdentifier id1, const flowIdentifier id2){
+    return ( id1.srcip == id2.srcip && id1.dstip == id2.dstip && id1.srcport == id2.srcport && id1.dstport == id2.dstport && id1.proto == id2.proto );
+}
+class flow{
+    public:
+    flowIdentifier identifier;
+
+    vector< pair<tm,long> > packets;
+};
+class trace{
+    public:
+    trace();
+    struct tm starttime, endtime;
+    vector<map<unsigned long long, vector<flow> > > flowMap;
+};
+trace::trace(void){
+    flowMap.resize(protocolList.size());
+}
+
+vector<trace> traceVector(1);
+
+unsigned long long myHash(const flowIdentifier identifier){
+
+    return ( ( ((unsigned long long)(identifier.srcip.byte1) << 24) + ((unsigned long long)(identifier.srcip.byte2) << 16) + ((unsigned long long)(identifier.srcip.byte3) << 8) + (unsigned long long)(identifier.srcip.byte4))* 59)
+            ^ (((unsigned long long)(identifier.dstip.byte1) << 24) + ((unsigned long long)(identifier.dstip.byte2) << 16) + ((unsigned long long)(identifier.dstip.byte3) << 8) + (unsigned long long)(identifier.dstip.byte4))
+            ^ (identifier.srcport << 16) ^ (identifier.dstport) ^ (identifier.proto);
+}
+
+
+void cleanFlowMap(){
+
+    char timestr1[32], timestr2[32];
+    strftime( timestr1, sizeof timestr1, "%x, %H:%M:%S", &timetracker);
+    strftime( timestr2, sizeof timestr2, "%x, %H:%M:%S", &currentTime);
+    timetracker = currentTime;
+
+    cout << "Cleaning trace " << traceCounter + 1 << " (" << protocolList[protocolIterator] << ") having seen timestamps\n     " << timestr1 << " (previous) and\n     " << timestr2 << " (current)...\n     Flow count in trace " << traceCounter + 1 << " before: " << traceVector[traceCounter].flowMap[protocolIterator].size() << "\n     Flow count in trace " << traceCounter + 1 << " after:  ";
+
+    map<unsigned long long, vector<flow> >::iterator it = traceVector[traceCounter].flowMap[protocolIterator].begin();
+    while( it != traceVector[traceCounter].flowMap[protocolIterator].end()){
+        int deletionCheck = 0;
+        for (int i = 0; i < it->second.size(); i++){
+            if ( (difftime(mktime(&timetracker) , mktime( &it->second[i].packets[it->second[i].packets.size() - 1].first )) > 300 ) && (it->second[i].packets.size() < 100 ) )
+            {
+                it->second.erase( it->second.begin() + i);
+                if (it->second.size() == 0){
+                    traceVector[traceCounter].flowMap[protocolIterator].erase(it++);
+                    deletionCheck = 1;
+                }
+            }
+        }
+        if (deletionCheck == 0){it++;}
+    }
+    cout << traceVector[traceCounter].flowMap[protocolIterator].size() << "\n";
+}
+void finalCleaning(int traceToClean ){
+    //timetracker = currentTime;
+    traceCounter--;
+    printFlowMap();
+    traceCounter++;
+
+    cout << "Performing final cleaning on trace " << traceToClean + 1 << " (" << protocolList[protocolIterator] << ")...\n     Flow count in trace " << traceToClean + 1 << " before: " << traceVector[traceToClean].flowMap[protocolIterator].size() << "\n     Flow count in trace " << traceToClean + 1 << " after:  ";
+
+
+    map<unsigned long long, vector<flow> >::iterator it = traceVector[traceToClean].flowMap[protocolIterator].begin();
+    while( it != traceVector[traceToClean].flowMap[protocolIterator].end()){
+        int deletionCheck = 0;
+        for (int i = 0; i < it->second.size(); i++){
+            if ( it->second[i].packets.size() < 100 )
+            {
+                it->second.erase( it->second.begin() + i);
+                if (it->second.size() == 0){
+                    traceVector[traceToClean].flowMap[protocolIterator].erase(it++);
+                    deletionCheck = 1;
+                }
+            }
+        }
+        if (deletionCheck == 0){it++;}
+    }
+    cout << traceVector[traceToClean].flowMap[protocolIterator].size() << "\n";
+}
+
+void printFlowMap(){
+
+    ofstream myfile;
+    myfile.open ("example.txt");
+
+    int total;
+
+    for (int k = 0; k < traceVector[traceCounter].flowMap.size(); k++){
+        myfile << "Total flows in flow " << k << ": " << traceVector[traceCounter].flowMap[k].size() << ". Flow list:\n";
+        for (auto const& it : traceVector[traceCounter].flowMap[k]){
+
+            for ( int i = 0; i < it.second.size(); i++){
+                //if (it.second[i].packets.size() > 100){
+                total = total + it.second[i].packets.size();
+                myfile << "\nFlow " <<
+                (int)it.second[i].identifier.srcip.byte1 << "." <<
+                (int)it.second[i].identifier.srcip.byte2 << "." <<
+                (int)it.second[i].identifier.srcip.byte3 << "." <<
+                (int)it.second[i].identifier.srcip.byte4 << ":" <<
+                (int)it.second[i].identifier.srcport << " -> " <<
+                (int)it.second[i].identifier.dstip.byte1 << "." <<
+                (int)it.second[i].identifier.dstip.byte2 << "." <<
+                (int)it.second[i].identifier.dstip.byte3 << "." <<
+                (int)it.second[i].identifier.dstip.byte4 << ":" <<
+                (int)it.second[i].identifier.dstport << " running ";
+                switch(it.second[i].identifier.proto){
+                    case 0 :
+                        myfile << "TCP/IP";
+                        break;
+                    case 1 :
+                        myfile << "UDP";
+                        break;
+                    case 2 :
+                        myfile << "ICMP";
+                        break;
+                }
+                myfile << " contains " << it.second[i].packets.size() << " packets. Timestamps:\n";
+
+                char timestr[32];
+                for ( int j = 0; j < (it.second[i].packets).size(); j++ )
+                {
+                    strftime( timestr, sizeof timestr, "   %x, %H:%M:%S", &(it.second[i].packets)[j].first);
+                    myfile << timestr << ":" << (it.second[i].packets)[j].second << "\n";
+                }
+
+            }//}
+        }
+
+    }
+    myfile << "\nTotal packets in flows: " << total;
+}
+
+/* Callback function invoked by libpcap for every incoming packet */
+void packet_handler(u_char *param, const struct pcap_pkthdr *header, const u_char *pkt_data)
+{
+
+
+    struct tm *ltime;
+    char timestr[16];
+    ip_header *ih;
+    udp_header *uh;
+    u_int ip_len;
+    u_short sport,dport;
+
+
+    ltime=localtime(&header->ts.tv_sec);
+    strftime( timestr, sizeof timestr, "%H:%M:%S", ltime);
+    lastTime = currentTime;
+    currentTime = *ltime;
+
+
+    //cout << setw(8) << left << timestr << ":" << setw(6) << left << header->ts.tv_usec << setw(5) << left << " len:" << setw(4) << left << header->len << " ";
+
+    /* retireve the position of the ip header */
+    ih = (ip_header *) (pkt_data + 14);
+
+    //length of ethernet header
+    ip_len = (ih->ver_ihl & 0xf) * 4;
+
+    /* retireve the position of the udp header */
+    uh = (udp_header *) ((u_char*)ih + ip_len);
+
+    /* convert from network byte order to host byte order */
+    sport = ntohs( uh->sport );
+    dport = ntohs( uh->dport );
+
+
+    // If time difference is more than 1 hour, create a new trace
+    if (difftime(mktime(&currentTime), mktime(&lastTime)) > 3600){
+        if (protocolIterator == 0){
+            cout << "\nNew trace identified...\n\n";
+            traceVector.resize(traceVector.size() + 1);
+            traceCounter++;
+        }
+        else{
+            traceCounter++;
+        }
+        traceVector[traceCounter - 1].endtime = lastTime;
+        traceVector[traceCounter].starttime = currentTime;
+        timetracker = currentTime;
+        finalCleaning(traceCounter - 1);
+    }
+
+    flowIdentifier currentIdentifier;
+    currentIdentifier.srcip = ih->saddr;
+    currentIdentifier.dstip = ih->daddr;
+    currentIdentifier.srcport = sport;
+    currentIdentifier.dstport = dport;
+    currentIdentifier.proto = currentProtocol;
+
+    unsigned long long hashValue = myHash(currentIdentifier);
+    int foundFlow = 0;  // changes to 1 if a flow with the same identifier is found
+
+    for ( int i = 0; i < traceVector[traceCounter].flowMap[protocolIterator][hashValue].size(); i++){
+        if (traceVector[traceCounter].flowMap[protocolIterator][hashValue][i].identifier == currentIdentifier)
+        {
+            traceVector[traceCounter].flowMap[protocolIterator][hashValue][i].packets.push_back(make_pair(*ltime, header->ts.tv_usec));
+            foundFlow = 1;
+            break;
+        }
+
+    }
+
+    if (foundFlow == 0){
+        flow tempflow;
+        tempflow.identifier = currentIdentifier;
+        (tempflow.packets).push_back(make_pair(*ltime, header->ts.tv_usec));
+        traceVector[traceCounter].flowMap[protocolIterator][hashValue].push_back(tempflow);
+    }
+
+    if (packetCount == 0){
+        timetracker = *ltime;
+        traceVector[traceCounter].starttime = currentTime;
+    }
+
+
+    if (difftime(mktime(ltime), mktime(&timetracker) ) > 1800){ // clean flows in 30 minute packet intervals
+        //counter++;
+        //if (counter == 4){printFlowMap();}
+        cleanFlowMap();
+    }
+
+    if (packetCount % 100000 == 0){cout << packetCount << "   " << traceVector[traceCounter].flowMap[protocolIterator].size() << "\n";}
+    packetCount++;
+
+}
+
+int main()
+{
+
+
+
+    /*
+    CImg<unsigned char> image("worldmap.jpg"), visu(500,400,1,3,0);
+    image.blur(2.5);
+    CImgDisplay main_disp(image,"Click a point"), draw_disp(visu,"Intensity profile");
+    */
+
+
+
+    // vector<char*> protocolList{ "tcp and ip", "udp" , "icmp"};
+    for ( protocolIterator = 0; protocolIterator < protocolList.size(); protocolIterator++ ){
+        string file = "C:\\Users\\hutchinsona2013\\Desktop\\dataset.pcap";
+        char errbuff[PCAP_ERRBUF_SIZE];
+        pcap_t * pcap = pcap_open_offline(file.c_str(), errbuff);
+        bpf_u_int32 net;
+
+        // compile the filter
+        struct bpf_program fcode;
+        if(pcap_compile(pcap, &fcode, protocolList[protocolIterator], 1, net ) <0 ){
+            fprintf(stderr,"\nUnable to compile the packet filter. Check the syntax.\n");
+            return -1;
+        }
+
+        // set the filter
+        if ( pcap_setfilter( pcap, &fcode) < 0){
+            fprintf(stderr, "\nThere is an error in setting the filter.\n");
+            return -1;
+        }
+        {/*
+        Format:     int pcap_loop(pcap_t *p, int cnt, pcap_handler callback, u_char *user)
+                            p is the pcap file to be read,
+                            cnt is the number of packets to be processed, with -1 meaning the entire file contents
+                            "callback" specifies a pcap_handler routine to be called with three arguments:
+                                *** a u_char pointer which is passed in the user argument to pcap_loop() or pcap_dispatch(),
+                                *** a const struct pcap_pkthdr pointer pointing to the packet time stamp and lengths,
+                                *** and a const u_char pointer to the first caplen (as given in the struct pcap_pkthdr a pointer to which is passed to the callback routine) bytes of data from the packet.
+                            user is passed as the first argument to callback below
+
+        The pcap_handler rotine should have the following format:
+                    typedef void (*pcap_handler)(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes);
+        */}
+
+        // Read through the packets, calling packet_handler for each packet
+        pcap_loop( pcap, -1, packet_handler, NULL);
+
+        //finalCleaning();
+        cout << "\n*********************************************\n\nFINAL FLOW SIZE: " << traceVector[traceCounter].flowMap[protocolIterator].size() << "\n\n\n";
+        packetCount = 0;
+        traceCounter = 0;
+    }
+
+
+
+
+    return 0;
+
+
+
+
+
+
+
+}
